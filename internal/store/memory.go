@@ -20,8 +20,6 @@ type Memory struct {
 
 	inspectionSeq int
 	queenSeq      int
-
-	ticketMu sync.Mutex
 }
 
 func NewMemory() *Memory {
@@ -99,27 +97,21 @@ type inspectionLedger struct {
 	latestID string
 }
 
-// InspectionReservation 是一次巡检写入预留的台账位置。
+// InspectionReservation 标记一次巡检准备写入哪只蜂箱；它不预占台账位置，
+// 真正的位置与编号都在 CommitInspection 的写锁内一次性确定。
 type InspectionReservation struct {
-	HiveID   string
-	Position int
+	HiveID string
 }
 
 func newInspectionLedger() *inspectionLedger {
 	return &inspectionLedger{rows: make(map[string]domain.Inspection)}
 }
 
-// place 把巡检放到预留位置，并登记该位置对应的最近一次编号。
-func (l *inspectionLedger) place(position int, row domain.Inspection) {
-	if position < 0 {
-		position = 0
-	}
-	for len(l.order) <= position {
-		l.order = append(l.order, "")
-	}
-	l.order[position] = row.ID
+// append 把巡检追加到台账末尾，并把最近一次编号指向这一行的真实编号。
+func (l *inspectionLedger) append(row domain.Inspection) {
+	l.order = append(l.order, row.ID)
 	l.rows[row.ID] = row
-	l.latestID = fmt.Sprintf("inspection-%06d", position+1)
+	l.latestID = row.ID
 }
 
 // list 按台账顺序读出所有已经落下的巡检行。
@@ -138,7 +130,8 @@ func (l *inspectionLedger) list() []domain.Inspection {
 	return items
 }
 
-// BeginInspection 读取蜂箱台账的当前长度，作为本次巡检的预留位置。
+// BeginInspection 在落账前确认蜂箱存在且接受巡检。它不预留台账位置：
+// 并发的多次提交各自在 CommitInspection 中串行追加，谁都不会覆盖谁。
 func (m *Memory) BeginInspection(hiveID string) (InspectionReservation, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -149,22 +142,13 @@ func (m *Memory) BeginInspection(hiveID string) (InspectionReservation, error) {
 	if !hive.AcceptsInspection() {
 		return InspectionReservation{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受巡检", hiveID, hive.State)
 	}
-	position := 0
-	if ledger, ok := m.inspectionLedger[hiveID]; ok {
-		position = len(ledger.order)
-	}
-	return InspectionReservation{HiveID: hiveID, Position: position}, nil
+	return InspectionReservation{HiveID: hiveID}, nil
 }
 
-// NextInspectionTicket 分配一个全局递增的巡检编号。
-func (m *Memory) NextInspectionTicket() string {
-	m.ticketMu.Lock()
-	defer m.ticketMu.Unlock()
-	m.inspectionSeq++
-	return fmt.Sprintf("inspection-%06d", m.inspectionSeq)
-}
-
-// CommitInspection 把巡检写到预留位置，并在同一临界区内推进最近巡检时间。
+// CommitInspection 在同一把写锁内复核蜂箱状态、分配全局唯一编号、把巡检
+// 追加到台账末尾并推进最近巡检时间。临界区不可拆分，否则并发提交可能取到
+// 相同的台账位置而互相覆盖；编号也只在确认写入时分配，被拒绝的提交不会
+// 消耗编号，也不会扰动已经落下的记录。
 func (m *Memory) CommitInspection(
 	reservation InspectionReservation,
 	row domain.Inspection,
@@ -184,8 +168,10 @@ func (m *Memory) CommitInspection(
 		ledger = newInspectionLedger()
 		m.inspectionLedger[reservation.HiveID] = ledger
 	}
+	m.inspectionSeq++
+	row.ID = fmt.Sprintf("inspection-%06d", m.inspectionSeq)
 	row.HiveID = reservation.HiveID
-	ledger.place(reservation.Position, row)
+	ledger.append(row)
 
 	observedAt := row.ObservedAt
 	hive.LastInspectionAt = &observedAt

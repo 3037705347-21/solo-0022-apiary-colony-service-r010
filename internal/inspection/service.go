@@ -50,7 +50,6 @@ func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, e
 	if err != nil {
 		return domain.Inspection{}, err
 	}
-	record.ID = s.store.NextInspectionTicket()
 	record.Concerns = DeriveConcerns(record)
 	saved, err := s.store.CommitInspection(reservation, record)
 	if err != nil {
