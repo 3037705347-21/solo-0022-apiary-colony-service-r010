@@ -34,8 +34,7 @@ func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, e
 	if observedAt.IsZero() {
 		observedAt = s.clock()
 	}
-	reservation, err := s.store.BeginInspection(hiveID)
-	if err != nil {
+	if err := s.store.PrecheckInspection(hiveID); err != nil {
 		return domain.Inspection{}, err
 	}
 	record, err := domain.NewInspection(
@@ -50,9 +49,8 @@ func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, e
 	if err != nil {
 		return domain.Inspection{}, err
 	}
-	record.ID = s.store.NextInspectionTicket()
 	record.Concerns = DeriveConcerns(record)
-	saved, err := s.store.CommitInspection(reservation, record)
+	saved, err := s.store.CommitInspection(hiveID, record)
 	if err != nil {
 		return domain.Inspection{}, err
 	}
